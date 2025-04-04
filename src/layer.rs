@@ -12,7 +12,6 @@ use opentelemetry::{
 use std::cell::RefCell;
 use std::fmt;
 use std::marker;
-use std::sync::Arc;
 use std::thread;
 #[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
 use std::time::Instant;
@@ -42,7 +41,7 @@ const FIELD_EXCEPTION_STACKTRACE: &str = "exception.stacktrace";
 /// [OpenTelemetry]: https://opentelemetry.io
 /// [tracing]: https://github.com/tokio-rs/tracing
 pub struct OpenTelemetryLayer<S, T> {
-    tracer: Arc<T>,
+    tracer: T,
     location: bool,
     tracked_inactivity: bool,
     with_threads: bool,
@@ -94,9 +93,19 @@ where
 ///
 /// See https://github.com/tokio-rs/tracing/blob/4dad420ee1d4607bad79270c1520673fa6266a3d/tracing-error/src/layer.rs
 pub(crate) struct WithContext {
+    ///
+    /// Provides access to the OtelData associated with the given span ID.
+    ///
     #[allow(clippy::type_complexity)]
     pub(crate) with_context: fn(&tracing::Dispatch, &span::Id, f: &mut dyn FnMut(&mut OtelData)),
-    pub(crate) with_activated_context: fn(&tracing::Dispatch, &span::Id, f: &mut dyn FnMut(&mut OtelData))
+
+    ///
+    /// Ensures the given SpanId has been activated - that is, created in the OTel side of things,
+    /// and had its SpanBuilder consumed - and then provides access to the OtelData associated with it.
+    ///
+    #[allow(clippy::type_complexity)]
+    pub(crate) with_activated_context:
+        fn(&tracing::Dispatch, &span::Id, f: &mut dyn FnMut(&mut OtelData)),
 }
 
 impl WithContext {
@@ -122,7 +131,7 @@ impl WithContext {
         &self,
         dispatch: &tracing::Dispatch,
         id: &span::Id,
-        mut f: impl FnMut(&mut OtelData)
+        mut f: impl FnMut(&mut OtelData),
     ) {
         (self.with_activated_context)(dispatch, id, &mut f)
     }
@@ -620,8 +629,6 @@ where
     /// # drop(subscriber);
     /// ```
     pub fn new(tracer: T) -> Self {
-        let tracer = Arc::new(tracer);
-
         OpenTelemetryLayer {
             tracer,
             location: true,
@@ -636,7 +643,7 @@ where
             },
             with_context: WithContext {
                 with_context: Self::get_context,
-                with_activated_context: Self::get_activated_context
+                with_activated_context: Self::get_activated_context,
             },
             _registry: marker::PhantomData,
         }
@@ -680,8 +687,6 @@ where
         Tracer: LayerTracer + Send + Sync + 'static,
         Tracer::Span: Send + Sync,
     {
-        let tracer = Arc::new(tracer);
-
         OpenTelemetryLayer {
             tracer,
             location: self.location,
@@ -691,7 +696,7 @@ where
             sem_conv_config: self.sem_conv_config,
             with_context: WithContext {
                 with_context: OpenTelemetryLayer::<S, Tracer>::get_context,
-                with_activated_context: OpenTelemetryLayer::<S, Tracer>::get_activated_context
+                with_activated_context: OpenTelemetryLayer::<S, Tracer>::get_activated_context,
             },
             _registry: self._registry,
             // cannot use ``..self` here due to different generics
@@ -917,21 +922,27 @@ where
         }
     }
 
-    fn get_activated_context(dispatch: &tracing::Dispatch, id: &span::Id, f: &mut dyn FnMut(&mut OtelData)) {
+    fn get_activated_context(
+        dispatch: &tracing::Dispatch,
+        id: &span::Id,
+        f: &mut dyn FnMut(&mut OtelData),
+    ) {
         let subscriber = dispatch
             .downcast_ref::<S>()
             .expect("subscriber should downcast to expected type; this is a bug!");
-        let span = subscriber.span(id).expect("registry should have a span for the current ID");
+        let span = subscriber
+            .span(id)
+            .expect("registry should have a span for the current ID");
 
         let layer = dispatch
             .downcast_ref::<OpenTelemetryLayer<S, T>>()
             .expect("layer should downcast to expected type; this is a bug!");
 
         let mut extensions = span.extensions_mut();
-        if let Some(mut otel_data) = extensions.get_mut::<OtelData>() {
+        if let Some(otel_data) = extensions.get_mut::<OtelData>() {
             // Activate the context
-            layer.start_cx(&mut otel_data);
-            f(&mut otel_data);
+            layer.start_cx(otel_data);
+            f(otel_data);
         }
     }
 
@@ -954,9 +965,8 @@ where
     /// the context in the process.
     ///
     fn start_cx(&self, otel_data: &mut OtelData) {
-        let tracer = &*self.tracer;
         if let Some(builder) = otel_data.builder.take() {
-            let span = builder.start_with_context(tracer, &otel_data.parent_cx);
+            let span = builder.start_with_context(&self.tracer, &otel_data.parent_cx);
             otel_data.parent_cx = otel_data.parent_cx.with_span(span);
         }
     }
@@ -964,18 +974,6 @@ where
     fn with_started_cx<U>(&self, otel_data: &mut OtelData, f: &dyn Fn(&OtelContext) -> U) -> U {
         self.start_cx(otel_data);
         f(&otel_data.parent_cx)
-    }
-}
-
-fn start_cx<T: opentelemetry::trace::Tracer>(tracer: &T, otel_data: &mut OtelData)
-where
-    <T as opentelemetry::trace::Tracer>::Span: Sync,
-    <T as opentelemetry::trace::Tracer>::Span: Send,
-    <T as opentelemetry::trace::Tracer>::Span: 'static,
-{
-    if let Some(builder) = otel_data.builder.take() {
-        let span = builder.start_with_context(tracer, &otel_data.parent_cx);
-        otel_data.parent_cx = otel_data.parent_cx.with_span(span);
     }
 }
 
@@ -1317,7 +1315,7 @@ where
         }) = otel_data
         {
             let cx = if let Some(builder) = builder {
-                let span = builder.start_with_context(&*self.tracer, &parent_cx);
+                let span = builder.start_with_context(&self.tracer, &parent_cx);
                 parent_cx.with_span(span)
             } else {
                 parent_cx

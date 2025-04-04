@@ -229,13 +229,9 @@ impl OpenTelemetrySpanExt for tracing::Span {
         self.with_subscriber(|(id, subscriber)| {
             if let Some(get_context) = subscriber.downcast_ref::<WithContext>() {
                 // If our span hasn't been built, we should build it and get the context in one call
-                get_context.with_activated_context(
-                    subscriber,
-                    id,
-                    |data: &mut OtelData| {
-                        cx = Some(data.parent_cx.clone());
-                    },
-                );
+                get_context.with_activated_context(subscriber, id, |data: &mut OtelData| {
+                    cx = Some(data.parent_cx.clone());
+                });
             }
         });
 
