@@ -591,7 +591,7 @@ where
 impl<S, T> OpenTelemetryLayer<S, T>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
-    T: LayerTracer + 'static + Sync + Send,
+    T: LayerTracer + 'static,
     T::Span: Send + Sync,
 {
     /// Set the [`Tracer`] that this layer will use to produce and track
@@ -684,7 +684,7 @@ where
     /// ```
     pub fn with_tracer<Tracer>(self, tracer: Tracer) -> OpenTelemetryLayer<S, Tracer>
     where
-        Tracer: LayerTracer + Send + Sync + 'static,
+        Tracer: LayerTracer + 'static,
         Tracer::Span: Send + Sync,
     {
         OpenTelemetryLayer {
@@ -1001,7 +1001,7 @@ type IdContextGuardStack = IdValueStack<ContextGuard>;
 impl<S, T> Layer<S> for OpenTelemetryLayer<S, T>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
-    T: LayerTracer + Send + Sync + 'static,
+    T: LayerTracer + 'static,
     T::Span: Send + Sync,
 {
     /// Creates an [OpenTelemetry `Span`] for the corresponding [tracing `Span`].
