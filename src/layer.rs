@@ -1299,13 +1299,13 @@ where
         let span = ctx.span(&id).expect("Span not found, this is a bug");
         // Now get mutable extensions for removal
         let (otel_data, timings) = {
-            let mut span_extensions = span.extensions_mut();
+            let mut extensions = span.extensions_mut();
             let timings = if self.tracked_inactivity {
-                span_extensions.remove::<Timings>()
+                extensions.remove::<Timings>()
             } else {
                 None
             };
-            (span_extensions.remove::<OtelData>(), timings)
+            (extensions.remove::<OtelData>(), timings)
         };
 
         if let Some(OtelData {

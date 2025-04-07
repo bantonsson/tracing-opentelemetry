@@ -178,7 +178,7 @@ impl OpenTelemetrySpanExt for tracing::Span {
                         // Create a new context with the new parent but preserve our span.
                         // NOTE - if the span has been created - if we have _already_
                         // consumed our SpanBuilder_ - we can no longer mutate our parent!
-                        // This is an intentional design decision. N
+                        // This is an intentional design decision.
                         if let Some(builder) = &mut data.builder {
                             // If we still have a builder, update it to use the new parent context
                             // when it's eventually built
@@ -221,10 +221,6 @@ impl OpenTelemetrySpanExt for tracing::Span {
 
     fn context(&self) -> Context {
         let mut cx = None;
-
-        // Ensure the OTel span is started if lazy
-        // let enter = self.enter();
-        // drop(enter);
 
         self.with_subscriber(|(id, subscriber)| {
             if let Some(get_context) = subscriber.downcast_ref::<WithContext>() {
