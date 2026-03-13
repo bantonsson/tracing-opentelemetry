@@ -1,5 +1,5 @@
 use crate::stack::IdValueStack;
-use crate::{OtelData, OtelDataLock, OtelDataState};
+use crate::{OtelData, OtelDataState};
 pub use filtered::FilteredOpenTelemetryLayer;
 use opentelemetry::ContextGuard;
 use opentelemetry::{
@@ -7,21 +7,19 @@ use opentelemetry::{
     Context as OtelContext, Key, KeyValue, StringValue, Value,
 };
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread;
 #[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
 use std::time::Instant;
 use std::{any::TypeId, borrow::Cow};
 use std::{fmt, vec};
-use std::{marker, mem::take};
+use std::{marker, mem};
 use tracing_core::span::{self, Attributes, Id, Record};
 use tracing_core::{field, Event, Subscriber};
 #[cfg(feature = "tracing-log")]
 use tracing_log::NormalizeEvent;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::layer::Filter;
-use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::registry::{LookupSpan, SpanRef};
 use tracing_subscriber::Layer;
 #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 use web_time::Instant;
@@ -37,10 +35,6 @@ const SPAN_EVENT_COUNT_FIELD: &str = "otel.tracing_event_count";
 const EVENT_EXCEPTION_NAME: &str = "exception";
 const FIELD_EXCEPTION_MESSAGE: &str = "exception.message";
 const FIELD_EXCEPTION_STACKTRACE: &str = "exception.stacktrace";
-
-std::thread_local! {
-    static INSIDE_TRACING: AtomicBool = const { AtomicBool::new(false) }
-}
 
 /// An [OpenTelemetry] propagation layer for use in a project that uses
 /// [tracing].
@@ -925,11 +919,12 @@ where
             //
             // In these case, we prefer to emit a smaller span tree instead of panicking.
             if let Some(span) = ctx.span(parent) {
-                let extensions = span.extensions();
-                if let Some(otel_data) = extensions.get::<OtelDataLock>() {
+                if span.extensions().get::<OtelData>().is_some() {
                     // If the parent span has a span builder the parent span should be started
                     // so we get a proper context with the parent span.
-                    return self.with_started_cx(&mut otel_data.lock(), &|cx| cx.clone());
+                    if let Some(cx) = self.start_cx_for_span(&span) {
+                        return cx;
+                    }
                 }
             }
         }
@@ -943,12 +938,7 @@ where
                 // If the span is contextual and we are not using context activation,
                 // we should use the current tracing context
                 ctx.lookup_current()
-                    .and_then(|span| {
-                        let extensions = span.extensions();
-                        extensions
-                            .get::<OtelDataLock>()
-                            .map(|data| self.with_started_cx(&mut data.lock(), &|cx| cx.clone()))
-                    })
+                    .and_then(|span| self.start_cx_for_span(&span))
                     .unwrap_or_else(OtelContext::current)
             }
         } else {
@@ -976,9 +966,9 @@ where
             .span(id)
             .expect("registry should have a span for the current ID");
 
-        let otel_data = span.extensions().get::<OtelDataLock>().cloned();
-        if let Some(otel_data) = otel_data {
-            f(&mut otel_data.lock());
+        let mut extensions = span.extensions_mut();
+        if let Some(otel_data) = extensions.get_mut::<OtelData>() {
+            f(otel_data);
         }
     }
 
@@ -1011,13 +1001,12 @@ where
             .span(id)
             .expect("registry should have a span for the current ID");
 
-        let otel_data = span.extensions().get::<OtelDataLock>().cloned();
+        // Activate the context using the transition dance (releases extensions before OTel call)
+        layer.start_cx_for_span(&span);
 
-        if let Some(otel_data) = otel_data {
-            let mut otel_data = otel_data.lock();
-            // Activate the context
-            layer.start_cx(&mut otel_data);
-            f(&mut otel_data);
+        let mut extensions = span.extensions_mut();
+        if let Some(otel_data) = extensions.get_mut::<OtelData>() {
+            f(otel_data);
         }
     }
 
@@ -1062,41 +1051,85 @@ where
         extra_attrs
     }
 
+    /// Starts the OTel span for the given tracing span using a two-phase transition.
     ///
-    /// Builds the OTel span associated with given OTel context, consuming the SpanBuilder within
-    /// the context in the process.
+    /// To avoid holding `ExtensionsMut` while calling into OpenTelemetry (which may
+    /// internally log via `tracing` and re-acquire extensions, causing a deadlock), this
+    /// method:
     ///
-    fn start_cx(&self, otel_data: &mut OtelData) {
-        if let OtelDataState::Context { .. } = &otel_data.state {
-            // If the context is already started, we do nothing.
-        } else if let OtelDataState::Builder {
-            builder,
-            parent_cx,
-            status,
-        } = take(&mut otel_data.state)
+    /// 1. Acquires `ExtensionsMut`, swaps `Builder` → `Transitioning` (moving the builder
+    ///    fields to the stack), then drops `ExtensionsMut`.
+    /// 2. Calls `start_with_context` without any lock held.
+    /// 3. Re-acquires `ExtensionsMut`, swaps `Transitioning` → `Context`.
+    ///
+    /// Returns the resulting OTel context, or `None` if:
+    /// - The span has no `OtelData` (already closed / not tracked).
+    /// - The span was closed concurrently during the transition (extremely rare).
+    fn start_cx_for_span(&self, span: &SpanRef<'_, S>) -> Option<OtelContext> {
+        // Phase 1: extract Builder fields (or return the existing Context).
+        let (builder, parent_cx, status) = {
+            let mut ext = span.extensions_mut();
+            let data = ext.get_mut::<OtelData>()?;
+            match &data.state {
+                OtelDataState::Context { current_cx } => return Some(current_cx.clone()),
+                OtelDataState::Transitioning => {
+                    // Another thread is in start_with_context for this span (Phase 2).
+                    // Drop the write lock and spin-wait using a shared read lock until the
+                    // transition completes. This prevents events fired after this call from
+                    // seeing Transitioning state and being silently dropped.
+                    drop(ext);
+                    loop {
+                        {
+                            let ext = span.extensions();
+                            match ext.get::<OtelData>() {
+                                Some(data) => match &data.state {
+                                    OtelDataState::Context { current_cx } => {
+                                        return Some(current_cx.clone());
+                                    }
+                                    OtelDataState::Transitioning => {} // still in progress
+                                    OtelDataState::Builder { .. } => return None, // unexpected
+                                },
+                                None => return None, // span closed during transition
+                            }
+                        }
+                        std::hint::spin_loop();
+                    }
+                }
+                OtelDataState::Builder { .. } => {
+                    let OtelDataState::Builder {
+                        builder,
+                        parent_cx,
+                        status,
+                    } = mem::replace(&mut data.state, OtelDataState::Transitioning)
+                    else {
+                        unreachable!()
+                    };
+                    (builder, parent_cx, status)
+                }
+            }
+        }; // ExtensionsMut dropped here — safe to call into OTel
+
+        // Phase 2: build the OTel span without any lock held.
+        #[cfg(all(test, reentrant_tracing_test))]
+        tracing::info!("This should not deadlock...");
+        let mut otel_span = builder.start_with_context(&self.tracer, &parent_cx);
+        otel_span.set_status(status);
+        let current_cx = parent_cx.with_span(otel_span);
+
+        // Phase 3: store the context back.  If `on_close` ran concurrently it will have removed
+        // `OtelData` from extensions entirely; in that case we simply discard the span.
         {
-            // We purposefully disable all tracing inside this call. Whoever called this is most
-            // likely holding `ExtensionsMut` so if anything inside any of the opentelemetry
-            // functions tries to log anything and any layer (including this one) tries to get the
-            // extensions again, we get a deadlock.
-            INSIDE_TRACING.with(|inside| inside.store(true, Ordering::Relaxed));
-            #[cfg(all(test, reentrant_tracing_test))]
-            tracing::info!("This should not deadlock...");
-            let mut span = builder.start_with_context(&self.tracer, &parent_cx);
-            span.set_status(status);
-            let current_cx = parent_cx.with_span(span);
-            INSIDE_TRACING.with(|inside| inside.store(false, Ordering::Relaxed));
-
-            otel_data.state = OtelDataState::Context { current_cx };
+            let mut ext = span.extensions_mut();
+            if let Some(data) = ext.get_mut::<OtelData>() {
+                if matches!(data.state, OtelDataState::Transitioning) {
+                    data.state = OtelDataState::Context {
+                        current_cx: current_cx.clone(),
+                    };
+                }
+            }
         }
-    }
 
-    fn with_started_cx<U>(&self, otel_data: &mut OtelData, f: &dyn Fn(&OtelContext) -> U) -> U {
-        self.start_cx(otel_data);
-        match &otel_data.state {
-            OtelDataState::Context { current_cx, .. } => f(current_cx),
-            _ => panic!("OtelDataState should be a Context after starting it; this is a bug!"),
-        }
+        Some(current_cx)
     }
 }
 
@@ -1189,14 +1222,14 @@ where
 
         let mut status = Status::Unset;
         updates.update(&mut builder, &mut status);
-        extensions.insert(OtelDataLock::new(OtelData {
+        extensions.insert(OtelData {
             state: OtelDataState::Builder {
                 builder,
                 parent_cx,
                 status,
             },
             end_time: None,
-        }));
+        });
     }
 
     fn on_enter(&self, id: &span::Id, ctx: Context<'_, S>) {
@@ -1207,14 +1240,11 @@ where
         let span = ctx.span(id).expect("Span not found, this is a bug");
 
         if self.context_activation {
-            // We must not hold the extensions when starting the context to avoid potential
-            // deadlocks.
-            let otel_data = span.extensions().get::<OtelDataLock>().cloned();
-            if let Some(otel_data) = otel_data {
-                self.with_started_cx(&mut otel_data.lock(), &|cx| {
-                    let guard = cx.clone().attach();
-                    GUARD_STACK.with(|stack| stack.borrow_mut().push(id.clone(), guard));
-                });
+            // start_cx_for_span releases ExtensionsMut before calling into OTel, avoiding
+            // potential deadlocks from OTel code that internally logs via tracing.
+            if let Some(cx) = self.start_cx_for_span(&span) {
+                let guard = cx.attach();
+                GUARD_STACK.with(|stack| stack.borrow_mut().push(id.clone(), guard));
             }
 
             if !self.tracked_inactivity {
@@ -1238,11 +1268,8 @@ where
         let span = ctx.span(id).expect("Span not found, this is a bug");
         let mut extensions = span.extensions_mut();
 
-        // We don't need mutable access to this but we're taking mutable extensions for timings
-        // anyway so let's use it instead of locking it twice. This is ok because here we will not
-        // start the opentelemetry context nor will we call any other code that might use tracing.
-        if let Some(otel_data) = extensions.get_mut::<OtelDataLock>() {
-            otel_data.lock().end_time = Some(crate::time::now());
+        if let Some(otel_data) = extensions.get_mut::<OtelData>() {
+            otel_data.end_time = Some(crate::time::now());
             if self.context_activation {
                 GUARD_STACK.with(|stack| stack.borrow_mut().pop(id));
             }
@@ -1272,9 +1299,9 @@ where
             span_builder_updates: &mut updates,
             sem_conv_config: self.sem_conv_config,
         });
-        let extensions = span.extensions();
-        if let Some(otel_data) = extensions.get::<OtelDataLock>() {
-            match &mut otel_data.lock().state {
+        let mut extensions = span.extensions_mut();
+        if let Some(otel_data) = extensions.get_mut::<OtelData>() {
+            match &mut otel_data.state {
                 OtelDataState::Builder {
                     builder, status, ..
                 } => {
@@ -1285,46 +1312,50 @@ where
                     // If the Context has been created, then update the span.
                     updates.update_span(&current_cx.span());
                 }
+                OtelDataState::Transitioning => {
+                    // OTel call in progress on another thread; attributes will be lost.
+                }
             }
         }
     }
 
     fn on_follows_from(&self, id: &Id, follows: &Id, ctx: Context<S>) {
         let span = ctx.span(id).expect("Span not found, this is a bug");
-        let otel_data = span.extensions().get::<OtelDataLock>().cloned();
-        let Some(data) = otel_data else {
+
+        // Check early that this span is tracked.
+        if span.extensions().get::<OtelData>().is_none() {
             return; // The span must already have been closed by us
-        };
+        }
 
         // The follows span may be filtered away (or closed), from this layer,
         // in which case we just drop the data, as opposed to panicking. This
         // uses the same reasoning as `parent_context` above.
         if let Some(follows_span) = ctx.span(follows) {
-            let follows_extensions = follows_span.extensions();
-            let follows_otel_data = follows_extensions.get::<OtelDataLock>();
-            let Some(follows_data) = follows_otel_data else {
+            if follows_span.extensions().get::<OtelData>().is_none() {
                 return; // The span must already have been closed by us
+            }
+
+            // Start the follows span using the transition dance (releases ExtensionsMut before
+            // calling OTel). If the follows span is Transitioning (concurrent close race), skip.
+            let Some(follows_cx) = self.start_cx_for_span(&follows_span) else {
+                return;
             };
+            let follows_context = follows_cx.span().span_context().clone();
 
-            let follows_data = follows_data.clone();
-            let mut follows_locked = follows_data.lock();
-            // We drop the extensions lock only after locking the inside. This is because we want to
-            // hinder potential `close` on the follows span. If we hold one or the other lock, the
-            // close implementation cannot progress to remove the span.
-            drop(follows_extensions);
-
-            let follows_context =
-                self.with_started_cx(&mut follows_locked, &|cx| cx.span().span_context().clone());
-            match &mut data.lock().state {
-                OtelDataState::Builder { builder, .. } => {
-                    if let Some(ref mut links) = builder.links {
-                        links.push(otel::Link::with_context(follows_context));
-                    } else {
-                        builder.links = Some(vec![otel::Link::with_context(follows_context)]);
+            let mut extensions = span.extensions_mut();
+            if let Some(otel_data) = extensions.get_mut::<OtelData>() {
+                match &mut otel_data.state {
+                    OtelDataState::Builder { builder, .. } => {
+                        if let Some(ref mut links) = builder.links {
+                            links.push(otel::Link::with_context(follows_context));
+                        } else {
+                            builder.links = Some(vec![otel::Link::with_context(follows_context)]);
+                        }
                     }
-                }
-                OtelDataState::Context { current_cx, .. } => {
-                    current_cx.span().add_link(follows_context, vec![]);
+                    OtelDataState::Context { current_cx, .. } => {
+                        current_cx.span().add_link(follows_context, vec![]);
+                    }
+                    OtelDataState::Transitioning => {}
                 }
             }
         }
@@ -1339,10 +1370,6 @@ where
     /// [`ERROR`]: tracing::Level::ERROR
     /// [`Error`]: opentelemetry::trace::StatusCode::Error
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        if INSIDE_TRACING.with(|inside| inside.load(Ordering::Relaxed)) {
-            // Ignore reentrant calls.
-            return;
-        }
         // Ignore events that are not in the context of a span
         if let Some(span) = event.parent().and_then(|id| ctx.span(id)).or_else(|| {
             event
@@ -1400,9 +1427,9 @@ where
                 otel_event.name = std::borrow::Cow::Borrowed(event.metadata().name());
             }
 
-            let otel_data = span.extensions().get::<OtelDataLock>().cloned();
+            let mut extensions = span.extensions_mut();
 
-            if let Some(otel_data) = otel_data {
+            if let Some(otel_data) = extensions.get_mut::<OtelData>() {
                 if self.location {
                     #[cfg(not(feature = "tracing-log"))]
                     let normalized_meta: Option<tracing_core::Metadata<'_>> = None;
@@ -1434,7 +1461,7 @@ where
                     }
                 }
 
-                match &mut otel_data.lock().state {
+                match &mut otel_data.state {
                     OtelDataState::Builder {
                         builder, status, ..
                     } => {
@@ -1463,6 +1490,9 @@ where
                         }
                         span.add_event(otel_event.name, otel_event.attributes);
                     }
+                    OtelDataState::Transitioning => {
+                        // OTel call in progress on another thread; event will be lost.
+                    }
                 }
             };
         }
@@ -1473,37 +1503,18 @@ where
     /// [`Span`]: opentelemetry::trace::Span
     fn on_close(&self, id: span::Id, ctx: Context<'_, S>) {
         let span = ctx.span(&id).expect("Span not found, this is a bug");
-        // Now get mutable extensions for removal
-        let (otel_data_lock, timings) = {
+        // Remove OtelData and timings from extensions atomically.
+        let (otel_data, timings) = {
             let mut extensions = span.extensions_mut();
             let timings = if self.tracked_inactivity {
                 extensions.remove::<Timings>()
             } else {
                 None
             };
-            (extensions.remove::<OtelDataLock>(), timings)
+            (extensions.remove::<OtelData>(), timings)
         };
 
-        if let Some(otel_data_lock) = otel_data_lock {
-            // If we cannot lock this, someone else is still doing some operations on this span.
-            // Wait until they're finished.
-            drop(otel_data_lock.lock());
-            debug_assert!(
-                Arc::strong_count(&otel_data_lock.inner) == 1,
-                "OtelDataLock should not be held by anything else when closing spans. This is a bug in `tracing-opentelemetry`, please file a bug report. This will be ignored when compiled with --release."
-            );
-            // We don't use Weak anywhere but this is a sanity check that no one else can ever get a
-            // hold on the `Arc` again. If we checked just the strong count and someone still had a
-            // `Weak`, they could upgrade at any time.
-            debug_assert!(
-                Arc::weak_count(&otel_data_lock.inner) == 0,
-                "OtelDataLock should never be made into `Weak`. This is a bug in `tracing-opentelemetry`, please file a bug report. This will be ignored when compiled with --release."
-            );
-
-            let otel_data = Arc::try_unwrap(otel_data_lock.inner)
-                .map(|lock| lock.into_inner().unwrap())
-                .unwrap_or_else(|otel_data| otel_data.lock().unwrap().clone());
-
+        if let Some(otel_data) = otel_data {
             // Append busy/idle timings when enabled.
             let timings = timings.map(|timings| {
                 let busy_ns = Key::new("busy_ns");
@@ -1515,20 +1526,19 @@ where
                 ]
             });
 
+            // We removed OtelData from extensions, so we are no longer holding any lock.
+            // It is safe to call into OTel and let it log whatever it wants.
             match otel_data.state {
                 OtelDataState::Builder {
                     builder,
                     parent_cx,
                     status,
                 } => {
-                    // We're not holding the extensions lock here so it's fine to just call to
-                    // opentelemetry and let it log whatever it wants. If we had a lock, we'd have
-                    // to set the default `Dispatch` to none to prevent deadlocks.
                     let mut span = builder.start_with_context(&self.tracer, &parent_cx);
                     if let Some(timings) = timings {
                         span.set_attributes(timings)
                     };
-                    span.set_status(status.clone());
+                    span.set_status(status);
                     if let Some(end_time) = otel_data.end_time {
                         span.end_with_timestamp(end_time);
                     } else {
@@ -1543,6 +1553,14 @@ where
                     otel_data
                         .end_time
                         .map_or_else(|| span.end(), |end_time| span.end_with_timestamp(end_time));
+                }
+                OtelDataState::Transitioning => {
+                    // Another thread swapped the state to Transitioning (in start_cx_for_span)
+                    // and is about to call start_with_context. The builder data is on that
+                    // thread's stack — we cannot export the span here. Silently discard it.
+                    //
+                    // This is an extremely rare race: it requires concurrent span entry (or
+                    // context access) and span close on the same span from different threads.
                 }
             }
         }

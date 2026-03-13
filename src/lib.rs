@@ -122,10 +122,7 @@ mod span_ext;
 
 mod stack;
 
-use std::{
-    sync::{Arc, Mutex, MutexGuard},
-    time::SystemTime,
-};
+use std::time::SystemTime;
 
 pub use layer::{layer, FilteredOpenTelemetryLayer, OpenTelemetryLayer};
 
@@ -134,25 +131,8 @@ pub use metrics::MetricsLayer;
 pub use otel_context::get_otel_context;
 pub use span_ext::{OpenTelemetrySpanExt, SetParentError};
 
-#[derive(Debug, Clone)]
-struct OtelDataLock {
-    inner: Arc<Mutex<OtelData>>,
-}
-
-impl OtelDataLock {
-    fn lock(&self) -> MutexGuard<'_, OtelData> {
-        self.inner.lock().expect("otel data lock poisoned")
-    }
-
-    fn new(inner: OtelData) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(inner)),
-        }
-    }
-}
-
 /// Per-span OpenTelemetry data tracked by this crate.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct OtelData {
     /// The state of the OtelData, which can either be a builder or a context.
     state: OtelDataState,
@@ -161,7 +141,7 @@ struct OtelData {
 }
 
 /// The state of the OpenTelemetry data for a span.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum OtelDataState {
     /// The span is being built, with a parent context and a builder.
@@ -172,6 +152,19 @@ pub(crate) enum OtelDataState {
     },
     /// The span has been started or accessed and is now in a context.
     Context { current_cx: opentelemetry::Context },
+    /// A transitional placeholder used while `start_with_context` is being called.
+    ///
+    /// When starting an OTel span we must not hold `ExtensionsMut` (a write guard) because
+    /// `start_with_context` may internally log via `tracing`, and if the same thread tries to
+    /// re-acquire `ExtensionsMut` for the same span it would deadlock.
+    ///
+    /// The transition dance: swap `Builder` → `Transitioning` (moving fields to the stack),
+    /// drop `ExtensionsMut`, call `start_with_context`, re-acquire `ExtensionsMut`, swap
+    /// `Transitioning` → `Context`.
+    ///
+    /// If `on_close` fires between the drop and re-acquire it will see `Transitioning` and
+    /// silently skip export — an extremely rare race that is acceptable in practice.
+    Transitioning,
 }
 
 impl Default for OtelDataState {

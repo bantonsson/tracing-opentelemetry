@@ -8,7 +8,7 @@ use tracing_subscriber::{
     Layer,
 };
 
-use crate::{OtelDataLock, OtelDataState};
+use crate::{OtelData, OtelDataState};
 
 use super::{OpenTelemetryLayer, SPAN_EVENT_COUNT_FIELD};
 
@@ -132,29 +132,36 @@ where
 
     fn on_close(&self, id: span::Id, ctx: Context<'_, S>) {
         let span = ctx.span(&id).expect("Span not found, this is a bug");
-        let otel_data = span.extensions().get::<OtelDataLock>().cloned();
 
         let count = span
             .extensions_mut()
             .remove::<EventCount>()
             .map_or(0, |count| count.0);
 
-        if let Some(otel_data) = otel_data {
-            let key_value = KeyValue::new(
-                Key::from_static_str(SPAN_EVENT_COUNT_FIELD),
-                Value::I64(i64::from(count)),
-            );
-            match &mut otel_data.lock().state {
-                OtelDataState::Builder {
-                    builder,
-                    parent_cx: _,
-                    status: _,
-                } => {
-                    builder.attributes.get_or_insert(Vec::new()).push(key_value);
-                }
-                OtelDataState::Context { current_cx } => {
-                    let span = current_cx.span();
-                    span.set_attribute(key_value);
+        {
+            let mut extensions = span.extensions_mut();
+            if let Some(otel_data) = extensions.get_mut::<OtelData>() {
+                let key_value = KeyValue::new(
+                    Key::from_static_str(SPAN_EVENT_COUNT_FIELD),
+                    Value::I64(i64::from(count)),
+                );
+                match &mut otel_data.state {
+                    OtelDataState::Builder {
+                        builder,
+                        parent_cx: _,
+                        status: _,
+                    } => {
+                        builder.attributes.get_or_insert(Vec::new()).push(key_value);
+                    }
+                    OtelDataState::Context { current_cx } => {
+                        let span = current_cx.span();
+                        span.set_attribute(key_value);
+                    }
+                    OtelDataState::Transitioning => {
+                        // The span wasn't properly started yet; the event count attribute will
+                        // be lost. This is an extremely rare race (concurrent span start and
+                        // close on the same span from different threads).
+                    }
                 }
             }
         }
